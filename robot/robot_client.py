@@ -65,7 +65,7 @@ class RobotClient:
 
 def main():
     # Cambia server_ip por la IP de la PC que ejecuta deteccion_server.py
-    client = RobotClient(server_ip="192.168.18.7", server_port=5000, interval=0.8)
+    client = RobotClient(server_ip="192.168.18.13", server_port=5000, interval=0.8)
     client.run()
 
 if __name__ == "__main__":

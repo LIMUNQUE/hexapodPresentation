@@ -1,4 +1,4 @@
-# deteccion_server.py
+# deteccion_server_no_tracker.py
 import cv2
 import time
 import requests
@@ -50,9 +50,6 @@ class DetectionServer:
                 }), 200
 
     def procesar_mensaje(self, personas_detectadas, timestamp):
-        """
-        Actualiza el estado solo si hay cambio (y lo imprime).
-        """
         with self.lock:
             if personas_detectadas != self.personas_presentes:
                 fecha_hora = datetime.fromtimestamp(timestamp).strftime('%H:%M:%S')
@@ -64,126 +61,163 @@ class DetectionServer:
                 self.timestamp = timestamp
 
     def run(self):
-        # Ejecuta Flask en hilo (threaded)
         self.app.run(host=self.host, port=self.port, debug=False, use_reloader=False, threaded=True)
 
 
-# ------------------ Detector de personas (inferencia cada 1s, debounce 10s) ------------------
+# ------------------ Detector (sin tracker, inferencia en real-time) ------------------
 class PersonDetector:
-    def __init__(self, server_ip="127.0.0.1", server_port=5000, cam_index=0,
-                 inference_interval=1.0, no_persons_grace=10.0):
+    def __init__(self,
+                 server_ip="127.0.0.1", server_port=5000, cam_index=0,
+                 no_persons_grace=10.0,      # 10s sin detecciones para declarar "no hay"
+                 conf_threshold=0.5):
         self.server_url = f"http://{server_ip}:{server_port}/persona_detectada"
+
         logger.info("Cargando modelo YOLO...")
-        self.model = YOLO("yolov8n.pt")  # ajusta ruta si necesario
+        self.model = YOLO("yolo11n.onnx")  # ajusta si usas otro checkpoint
 
         logger.info("Configurando cámara...")
         self.cap = cv2.VideoCapture(cam_index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 10)
-
+        # no forzamos FPS — la inferencia será por frame
         if not self.cap.isOpened():
             raise Exception("No se pudo abrir la cámara")
 
-        cv2.namedWindow("Detección de Personas - YOLO", cv2.WINDOW_NORMAL)
+        # Nombre de ventana único para evitar ventanas múltiples
+        self.WINDOW_NAME = "Detección de Personas - YOLO (RealTime)"
+        cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
 
-        # Lógica de tiempos/estados
-        self.inference_interval = inference_interval   # 1s
-        self.no_persons_grace = no_persons_grace         # 10s
-        self.last_inference_time = 0.0
-        self.last_detection_time = 0.0   # última vez que se detectó persona
-        self.state_sent = False          # último estado enviado al servidor
-        self.current_frame = None
-        logger.info("Detector inicializado")
+        # Parámetros
+        self.no_persons_grace = no_persons_grace
+        self.conf_threshold = conf_threshold
 
-    def detectar_personas_frame(self, frame):
-        """Ejecuta YOLO sobre el frame y devuelve True si hay persona con confianza>0.5"""
+        # Tiempos
+        self.last_detection_time = 0.0     # última vez que YOLO vio una persona
+
+        # Estado enviado al servidor
+        self.server_state = False          # False: no hay personas; True: hay
+
+        logger.info("Detector inicializado (sin tracker)")
+
+    def _pick_any_person(self, result):
+        """
+        Recorre cajas y devuelve True si encuentra al menos una persona por encima del umbral.
+        Además dibuja todas las cajas de persona sobre el frame.
+        """
+        found = False
+        if result.boxes is None:
+            return False
+
+        for box in result.boxes:
+            try:
+                cls = int(box.cls)
+            except Exception:
+                # algunos formatos pueden diferir; ignorar si no tiene clase
+                continue
+            if cls == 0:  # clase persona (COCO)
+                conf = float(box.conf)
+                if conf >= self.conf_threshold:
+                    found = True
+        return found
+
+    def _run_yolo_and_annotate(self, frame):
+        """
+        Ejecuta YOLO sobre el frame, dibuja cajas y devuelve (persona_detectada_bool, annotated_frame)
+        """
+        # Si tu versión de ultralytics soporta show=False, puedes añadirlo para evitar GUIs internas.
         results = self.model(frame, verbose=False)
         persona_detectada = False
 
+        # Dibujar cajas: iteramos resultados y boxes
         for result in results:
-            if result.boxes is not None:
-                for box in result.boxes:
-                    if int(box.cls) == 0:  # clase persona
-                        confidence = float(box.conf)
-                        if confidence > 0.5:
-                            persona_detectada = True
-                            x1, y1, x2, y2 = map(int, box.xyxy[0])
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(frame, f"Persona {confidence:.2f}",
-                                        (x1, y1 - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.6, (0, 255, 0), 2)
+            if result.boxes is None:
+                continue
+            for box in result.boxes:
+                try:
+                    cls = int(box.cls)
+                    conf = float(box.conf)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                except Exception:
+                    continue
+                if cls == 0 and conf >= self.conf_threshold:
+                    persona_detectada = True
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f"Persona {conf:.2f}", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         return persona_detectada, frame
 
-    def notificar_servidor(self, personas_presentes):
-        """Envía POST solo cuando cambia el estado (la llamada desde run asegura eso)."""
+    def _notificar_servidor(self, personas_presentes):
         try:
             payload = {"personas_detectadas": personas_presentes, "timestamp": time.time()}
-            response = requests.post(self.server_url, json=payload, timeout=2)
-            if response.status_code == 200:
+            resp = requests.post(self.server_url, json=payload, timeout=2)
+            if resp.status_code == 200:
                 estado = "ACTIVAR" if personas_presentes else "DESACTIVAR"
                 logger.info(f"✅ Notificación enviada: {estado}")
             else:
-                logger.warning(f"⚠️ Respuesta inesperada del servidor: {response.status_code}")
+                logger.warning(f"⚠️ Respuesta inesperada del servidor: {resp.status_code}")
         except Exception as e:
             logger.error(f"❌ Error al notificar servidor: {e}")
 
     def run(self):
-        logger.info("🚀 Iniciando loop de detección (inferencia cada 1s, grace 10s)...")
+        logger.info("🚀 Loop de detección en tiempo real iniciado (sin tracker)")
         try:
             while True:
                 now = time.monotonic()
-                # Leer frame continuamente para mostrar vídeo fluido
                 ret, frame = self.cap.read()
                 if not ret:
                     logger.error("No se pudo leer frame de la cámara")
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                     continue
-                self.current_frame = frame.copy()
 
-                # Hacer inferencia solo cada inference_interval segundos
-                if now - self.last_inference_time >= self.inference_interval:
-                    self.last_inference_time = now
-                    persona_detectada, frame_annotated = self.detectar_personas_frame(self.current_frame)
-                    # Si detecta persona -> actualizar inmediatamente
-                    if persona_detectada:
-                        self.last_detection_time = now
-                        # Si el último estado enviado era False, enviar True
-                        if not self.state_sent:
-                            self.notificar_servidor(True)
-                            self.state_sent = True
-                    else:
-                        # No se detectó en esta inferencia; solo declarar "no hay personas"
-                        # si han pasado no_persons_grace desde la última detección
-                        if self.last_detection_time == 0 or (now - self.last_detection_time) >= self.no_persons_grace:
-                            if self.state_sent:
-                                # enviamos cambio a False (solo si antes estaba True)
-                                self.notificar_servidor(False)
-                                self.state_sent = False
-                        # Si aún no han pasado los 10s, no hacemos nada (esperamos)
-                    # Mostrar frame anotado
-                    cv2.imshow("Detección de Personas - YOLO", frame_annotated)
+                # Si el usuario cerró la ventana con el gestor de ventanas, salir limpiamente
+                if cv2.getWindowProperty(self.WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                    logger.info("Ventana cerrada por el usuario. Saliendo...")
+                    break
+
+                # Ejecutar YOLO en cada frame (real-time)
+                persona_detectada, annotated = self._run_yolo_and_annotate(frame)
+
+                if persona_detectada:
+                    # refrescar última detección
+                    self.last_detection_time = now
+
+                    # si antes el servidor estaba en False -> notificar True inmediatamente
+                    if not self.server_state:
+                        self._notificar_servidor(True)
+                        self.server_state = True
                 else:
-                    # No es tiempo de inferencia: mostramos el frame sin anotaciones o con texto de espera
-                    display = self.current_frame.copy()
-                    cv2.putText(display, "Esperando siguiente inferencia...", (10, 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 2)
-                    cv2.imshow("Detección de Personas - YOLO", display)
+                    # sin detección en este frame: comprobamos si han pasado N segundos desde la última detección
+                    # si server_state == True y han pasado no_persons_grace => notificar Ausencia
+                    time_since_last = now - self.last_detection_time if self.last_detection_time > 0 else float('inf')
+                    if self.server_state and time_since_last >= self.no_persons_grace:
+                        self._notificar_servidor(False)
+                        self.server_state = False
 
-                # Esc para salir
+                # Overlay informativo
+                last_elapsed = (now - self.last_detection_time) if self.last_detection_time > 0 else float('inf')
+                info1 = f"Evidencia hace: {0 if last_elapsed == float('inf') else last_elapsed:.1f}s"
+                info2 = f"Estado: {'PRESENTE' if self.server_state else 'AUSENTE'}"
+                cv2.putText(annotated, info1, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (220, 220, 220), 2)
+                cv2.putText(annotated, info2, (10, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 180, 255), 2)
+
+                cv2.imshow(self.WINDOW_NAME, annotated)
+
+                # ESC para salir
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
 
-                # pequeño sleep para bajar carga de CPU en el loop
-                time.sleep(0.01)
-
+                # pequeño respiro para la CPU (si tu hardware puede procesar más rápido, reducir o quitar)
+                time.sleep(0.001)
         finally:
             self.cleanup()
 
     def cleanup(self):
         if self.cap:
             self.cap.release()
+        try:
+            cv2.destroyWindow(self.WINDOW_NAME)
+        except Exception:
+            pass
         cv2.destroyAllWindows()
         logger.info("🧹 Recursos liberados")
 
@@ -191,7 +225,7 @@ class PersonDetector:
 # ------------------ Main ------------------
 def main():
     try:
-        # Iniciar servidor Flask en hilo
+        # Servidor Flask en hilo
         server = DetectionServer(host='0.0.0.0', port=5000)
         server_thread = Thread(target=server.run, daemon=True)
         server_thread.start()
@@ -200,11 +234,15 @@ def main():
         print("\n" + "="*50)
         print("📶 SERVIDOR de DETECCIÓN iniciado en: 0.0.0.0:5000")
         print("Endpoints: /persona_detectada (POST)  /estado (GET)")
-        print("Inferencia cada 1s. 'No personas' se declara tras 10s sin detecciones.")
+        print(f"Reglas: inferencia en tiempo real, 'No personas' tras {10.0}s sin detecciones")
         print("="*50 + "\n")
 
-        detector = PersonDetector(server_ip="127.0.0.1", server_port=5000,
-                                  cam_index=0, inference_interval=1.0, no_persons_grace=10.0)
+        detector = PersonDetector(
+            server_ip="127.0.0.1", server_port=5000,
+            cam_index=0,
+            no_persons_grace=10.0,
+            conf_threshold=0.5
+        )
         detector.run()
     except Exception as e:
         logger.error(f"❌ Error fatal: {e}")
